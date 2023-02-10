@@ -11,17 +11,25 @@ import (
 
 // TimingWheel is an implementation of Hierarchical Timing Wheels.
 type TimingWheel struct {
-	tick      int64 // in milliseconds
+	// 每个bucket代表的间隔
+	tick int64 // in milliseconds
+	// bucket的数量
 	wheelSize int64
 
-	interval    int64 // in milliseconds
+	// timingwheel的周期
+	interval int64 // in milliseconds
+	// 目前已知的当前时间，由最近的timer到期后更新推进
+	// 当前层级可表示的时间范围为[tw.curTime, tw.curTime+tw.interval)
 	currentTime int64 // in milliseconds
-	buckets     []*bucket
-	queue       *delayqueue.DelayQueue
+	// 每个bucket包含若干timer，这些timer的到期时间都一样
+	buckets []*bucket
+	// 延时队列，内部使用最小堆保存buckets，堆顶的bucket为最近要到期的bucket
+	queue *delayqueue.DelayQueue
 
 	// The higher-level overflow wheel.
 	//
 	// NOTE: This field may be updated and read concurrently, through Add().
+	// 指向下一级timingwheel，保存超出当前层级时间范围的buckets
 	overflowWheel unsafe.Pointer // type: *TimingWheel
 
 	exitC     chan struct{}
@@ -29,6 +37,7 @@ type TimingWheel struct {
 }
 
 // NewTimingWheel creates an instance of TimingWheel with the given tick and wheelSize.
+// 指定第一级的步长tick和每一级的bucket数量
 func NewTimingWheel(tick time.Duration, wheelSize int64) *TimingWheel {
 	tickMs := int64(tick / time.Millisecond)
 	if tickMs <= 0 {
@@ -69,12 +78,18 @@ func (tw *TimingWheel) add(t *Timer) bool {
 		// Already expired
 		return false
 	} else if t.expiration < currentTime+tw.interval {
+		// 目前已知的当前时间为currentTime，则本层时间轮可表示的时间范围为
+		// [currentTime, currentTime+tw.interval)
+		// 由currentTime确定本层级初始bucket的位置
+		// 索引0位置的bucket并不一定是本层级开始位置的bucket
+
 		// Put it into its own bucket
 		virtualID := t.expiration / tw.tick
 		b := tw.buckets[virtualID%tw.wheelSize]
 		b.Add(t)
 
 		// Set the bucket expiration time
+		// 由于virtualID的计算方式，bucket的expiration会比timer的expiration稍早
 		if b.SetExpiration(virtualID * tw.tick) {
 			// The bucket needs to be enqueued since it was an expired bucket.
 			// We only need to enqueue the bucket when its expiration time has changed,
@@ -94,6 +109,7 @@ func (tw *TimingWheel) add(t *Timer) bool {
 				&tw.overflowWheel,
 				nil,
 				unsafe.Pointer(newTimingWheel(
+					// 已下级timingwheel的周期作为overflow timingwheel的tick
 					tw.interval,
 					tw.wheelSize,
 					currentTime,
@@ -118,6 +134,8 @@ func (tw *TimingWheel) addOrRun(t *Timer) {
 	}
 }
 
+// advanceClock 使用expiration更新当前时间
+// expiration的值来自某个刚到期的bucket的expiration
 func (tw *TimingWheel) advanceClock(expiration int64) {
 	currentTime := atomic.LoadInt64(&tw.currentTime)
 	if expiration >= currentTime+tw.tick {
@@ -145,8 +163,14 @@ func (tw *TimingWheel) Start() {
 			select {
 			case elem := <-tw.queue.C:
 				b := elem.(*bucket)
+				// 推进timingwheel的当前时间
 				tw.advanceClock(b.Expiration())
+				// 在bucket对应的timer列表上进行迭代
+				// 如果某个timer到期则执行，否则加回时间轮
 				b.Flush(tw.addOrRun)
+				// 延时队列的过期时间来自bucket的expiration
+				// 但是bucket下的timer的expiration可能比所属bucket的expiration稍晚
+				// 原因是TimingWheel.add()里virtualID的取整计算方式
 			case <-tw.exitC:
 				return
 			}

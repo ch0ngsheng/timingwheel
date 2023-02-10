@@ -20,6 +20,7 @@ type Timer struct {
 	b unsafe.Pointer // type: *bucket
 
 	// The timer's element.
+	// Timer在bucket的timers双向链表中的元素指针
 	element *list.Element
 }
 
@@ -39,6 +40,10 @@ func (t *Timer) setBucket(b *bucket) {
 // needs to know whether t.task is completed, it must coordinate with t.task explicitly.
 func (t *Timer) Stop() bool {
 	stopped := false
+	// 使用CAS for-loop无锁的方式将timer从它的bucket中移除
+	// getBucket是原子方法，Remove内加了锁
+	// 整个Stop方法没有加锁
+	// Timer.Stop和bucket.Flush可能并发执行
 	for b := t.getBucket(); b != nil; b = t.getBucket() {
 		// If b.Remove is called just after the timing wheel's goroutine has:
 		//     1. removed t from b (through b.Flush -> b.remove)
@@ -52,6 +57,7 @@ func (t *Timer) Stop() bool {
 	return stopped
 }
 
+// bucket timingwheel上的一个格子，包含过期时间及该时间到期的若干timer
 type bucket struct {
 	// 64-bit atomic operations require 64-bit alignment, but 32-bit
 	// compilers do not ensure it. So we must keep the 64-bit field
@@ -61,7 +67,8 @@ type bucket struct {
 	// and https://go101.org/article/memory-layout.html.
 	expiration int64
 
-	mu     sync.Mutex
+	mu sync.Mutex
+	// 该bucket下的所有timer的链表
 	timers *list.List
 }
 
@@ -72,17 +79,21 @@ func newBucket() *bucket {
 	}
 }
 
+// Expiration 原子性地获取bucket的过期时间
 func (b *bucket) Expiration() int64 {
 	return atomic.LoadInt64(&b.expiration)
 }
 
+// SetExpiration 原子性地设置bucket的过期时间，返回和之前设置的时间是否相同
 func (b *bucket) SetExpiration(expiration int64) bool {
 	return atomic.SwapInt64(&b.expiration, expiration) != expiration
 }
 
+// Add 向bucket中添加指定timer
 func (b *bucket) Add(t *Timer) {
 	b.mu.Lock()
 
+	// 返回的e是双向链表中新增的元素指针
 	e := b.timers.PushBack(t)
 	t.setBucket(b)
 	t.element = e
@@ -99,18 +110,21 @@ func (b *bucket) remove(t *Timer) bool {
 		// In either case, the returned value does not equal to b.
 		return false
 	}
+	// 从bucket的timers双向链表中移除timer
 	b.timers.Remove(t.element)
 	t.setBucket(nil)
 	t.element = nil
 	return true
 }
 
+// Remove 从bucket中移除指定timer
 func (b *bucket) Remove(t *Timer) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.remove(t)
 }
 
+// Flush 顺序更新bucket中的全部timers
 func (b *bucket) Flush(reinsert func(*Timer)) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

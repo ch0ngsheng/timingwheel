@@ -55,12 +55,14 @@ func BenchmarkStandardTimer_StartStop(b *testing.B) {
 	}
 	for _, c := range cases {
 		b.Run(c.name, func(b *testing.B) {
+			// 创建存量timer
 			base := make([]*time.Timer, c.N)
 			for i := 0; i < len(base); i++ {
 				base[i] = time.AfterFunc(genD(i), func() {})
 			}
 			b.ResetTimer()
 
+			// 测试增量timer的启停耗时
 			for i := 0; i < b.N; i++ {
 				time.AfterFunc(time.Second, func() {}).Stop()
 			}
